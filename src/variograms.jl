@@ -1,6 +1,42 @@
 module Variograms
 
-using LinearAlgebra, LsqFit, StatsBase
+using LinearAlgebra, LsqFit, StatsBase, ProgressMeter
+
+
+function empirical_variogram_spatiotemporal(times, positions, values, trange, prange)
+
+    # check sizes
+    length(times) == size(positions, 1) == length(values) || throw(DimensionMismatch())
+
+    N = length(values) # number of datapoints
+    Nt = length(trange)
+    Np = length(prange)
+
+    # 2d matrices to store counts and sums
+    counts = zeros(Nt, Np) 
+    totals = zeros(Nt, Np)
+
+    @showprogress for i=1:N, j=(i+1):N # for every pair of datapoints
+        dt = abs(times[j] - times[i])
+        if dt <= trange[end] + step(trange)
+            dp = norm(positions[j, :] - positions[i, :])
+            if  dp <= prange[end] + step(prange)
+                t_ind = searchsortedlast(trange, dt)
+                p_ind = searchsortedlast(prange, dp)
+                counts[t_ind, p_ind] += 1
+                totals[t_ind, p_ind] += (values[j] - values[i])^2
+            end
+        end
+    end
+
+    return totals ./ (2 * counts), counts
+end
+
+
+
+
+
+
 
 function empirical_variogram(pos, v, drange; N=1000)
 
