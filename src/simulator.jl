@@ -8,6 +8,7 @@ using CoverageControllers, SpatiotemporalGPs
 
 using JLD2: JLD2, jldopen
 using FileIO: load
+using CodecZlib # for compression
 
 struct Measurement{T,P,F}
     t::T
@@ -64,10 +65,11 @@ struct SimState{T, X, U, M}
     xs::X      # robot positions
     us::U      # robot control inputs
     
-    wx_hat::M  # estimated wind speed x
-    wy_hat::M  # .. y
-    wx_q::M    # clarity in x
-    wy_q::M    # clarity in y
+    # wx_state::M  # estimated wind speed x
+    # wy_state::M  # .. y
+    wx_hat::M
+    wy_hat::M
+    w_q::M
 end
 
 
@@ -146,17 +148,10 @@ function simulate(
         Σ_meas,
     )
 
-
-    # save the new maps
-    w_ts = [t0]
-    wx_hats = [STGPKF.get_estimate(stgpkf_problem, wx_state)]
-    wy_hats = [STGPKF.get_estimate(stgpkf_problem, wy_state)]
-    wx_qs = [STGPKF.get_estimate_clarity(stgpkf_problem, wx_state)]
-    wy_qs = [STGPKF.get_estimate_clarity(stgpkf_problem, wy_state)]
-
     # create a clarity map
     # get the average clarity map (should not do anything in principle, since both of the clarity maps should be same)
-    q_map = 0.5 * (wx_qs[end] + wy_qs[end])
+    q_map = STGPKF.get_estimate_clarity(stgpkf_problem, wx_state)
+
     # sanity check dimensions are compatible
     @assert length(q_map) == prod(coverage_grid.N)
 
@@ -174,8 +169,20 @@ function simulate(
     )
     us = [u0]
 
+    # todo: write setup to JLD file
+    save_setup(filepath, stgpkf_problem, coverage_grid, ts, N_robots)
+          
+    wx_hat = STGPKF.get_estimate(stgpkf_problem, wx_state)
+          wy_hat = STGPKF.get_estimate(stgpkf_problem, wy_state)
+          q_map = STGPKF.get_estimate_clarity(stgpkf_problem, wx_state)
 
-    @showprogress for (it, t) in enumerate(ts[2:end])
+          sim_state = SimState(t0, x0, u0, wx_hat, wy_hat, q_map)
+          append_result(filepath, 1, sim_state)
+
+
+          it = 1
+    @showprogress for t in ts[2:end]
+        it +=1 
 
         # first try and move time forwards
         # grab all the robot states and control inputs
@@ -230,20 +237,21 @@ function simulate(
               Σ_meas,
           )
 
-          # save the new maps
-          push!(w_ts, t)
-          push!(wx_hats, STGPKF.get_estimate(stgpkf_problem, wx_state))
-          push!(wy_hats, STGPKF.get_estimate(stgpkf_problem, wy_state))
-          push!(wx_qs, STGPKF.get_estimate_clarity(stgpkf_problem, wx_state))
-          push!(wy_qs, STGPKF.get_estimate_clarity(stgpkf_problem, wy_state))
-
           last_assimilate_time = t
           empty!(tmp_measurements) # reset all the measurements
+
         end
 
-        # get the clarity map
-        q_map = 0.5 * (wx_qs[end] + wy_qs[end])
-        coverage_q_map = reshape(q_map, coverage_grid.N)
+        # every iteration, save the states
+          wx_hat = STGPKF.get_estimate(stgpkf_problem, wx_state)
+          wy_hat = STGPKF.get_estimate(stgpkf_problem, wy_state)
+          q_map = STGPKF.get_estimate_clarity(stgpkf_problem, wx_state)
+
+          sim_state = SimState(t, x, u, wx_hat, wy_hat, q_map)
+          append_result(filepath, it, sim_state)
+
+          # get the clarity map
+          coverage_q_map = reshape(q_map, coverage_grid.N)
 
         # decide the control input for the current step
         u = controllers(
@@ -258,12 +266,50 @@ function simulate(
 
     end
 
-    return SimResult(ts, xs, us, w_ts, wx_hats, wy_hats, wx_qs, wy_qs)
+    return 
 
 end
 
 
+function save_setup(fname::AbstractString, stgpkf_problem, coverage_grid, ts, Nr)
+    jldopen(fname, "a"; compress=true) do fid
+        group = JLD2.Group(fid, "setup")
+        group["stgpkf_problem"] = stgpkf_problem
+        group["coverage_grid"] = coverage_grid
+        group["ts"] = ts
+        group["Nr"] = Nr
+    end
+end
 
+"""
+    append_result(fname::AbstractString, gname::String, result::T)
+
+Append a `T` instance to a result file
+
+## Arguments
+
+- `fname`: The name of the result file to be appended to.
+- `gname`: The unique `JLD2` group name to be used in the file for grouping the data
+  associated with this particular `Result`.
+- `result`:  The `T` data to be written to the file.
+"""
+function append_result(fname::AbstractString, tind::Integer, result::SimState)
+    jldopen(fname, "a", compress=true) do fid
+        group = JLD2.Group(fid, string(tind))
+        group["sim_state"] = result
+    end
+end
+
+
+function read_result_file(fname::AbstractString, tind::Integer)
+    dat = load(fname, "$(tind)/sim_state")
+    return dat
+end
+
+function read_result_file(fname::AbstractString, ds::AbstractString)
+    dat = load(fname, ds)
+    return dat
+end
 
 @recipe function f(grid::CoverageControllers.Grid, q_vec::VF) where {F, VF<:AbstractVector{F}}
 
@@ -277,6 +323,84 @@ end
     xs, ys, M'
   end
 
+end
+
+
+## utilities for plotting
+
+using Plots
+function visualize_results(time, filepath, windData)
+
+    sim_ts = Simulator.read_result_file(filepath, "setup/ts")
+    stgpkf_problem = Simulator.read_result_file(filepath, "setup/stgpkf_problem")
+    coverage_grid = Simulator.read_result_file(filepath, "setup/coverage_grid")
+
+    # determine the time indices
+    res_ind = searchsortedlast(sim_ts, time)
+    sim_state = read_result_file(filepath, "$(res_ind)/sim_state")
+    
+    # plot the true windData
+    plot1 = plot(windData, time; plottype=:wx, titlefontsize=9)
+
+    robot_positions =  sim_state.xs
+    scatter!(first.(robot_positions), last.(robot_positions), label=false, color=:white)
+    # compute the default boundary 
+    gridBoundary = CoverageControllers.GridBoundary(coverage_grid)
+    for b in gridBoundary
+        plot!(b; dist=0.75)
+    end
+
+    # plot the stgpkf state
+    plot2 = plot(coverage_grid, sim_state.wx_hat; clims=(-8,8), cmap=:balance, yticks=:none, ylabel="")
+
+    # plot the clarity
+    plot3 = plot(coverage_grid, sim_state.w_q; clims=(0, 1), yticks=:none, ylabel="")
+
+    # plot all
+    layout = @layout [a b c]
+    plot(plot1, plot2, plot3, layout=layout, size=(1200, 500))
+end
+
+function get_trajectories(filepath; tmax=Inf)
+
+    Nr = read_result_file(filepath, "setup/Nr")
+    ts = read_result_file(filepath, "setup/ts")
+
+    xs = [Float64[] for i=1:Nr]
+    ys = [Float64[] for i=1:Nr]
+
+    # get the max number of elements to plot
+    Nt = searchsortedlast(ts, tmax)
+    
+    @showprogress for i=1:Nt
+        simstate = read_result_file(filepath, "$(i)/sim_state")
+
+        x = simstate.xs
+        for r = 1:Nr
+            push!(xs[r], x[r][1])
+            push!(ys[r], x[r][2])
+        end
+    end
+
+    return ts, xs, ys
+end
+
+
+function plot_trajectories!(filepath; tmax=Inf, fade=false, kwargs...)
+
+    _, xs, ys = get_trajectories(filepath; tmax=tmax)
+
+    Nr = length(xs)
+
+    for r=1:Nr
+        if fade
+            n = length(xs[r])
+            plot!(xs[r], ys[r]; linealpha=range(0.0, 1.0, length=n), kwargs...)
+      else
+          plot!(xs[r], ys[r]; kwargs...)
+      end
+    end
+    plot!()
 end
 
 
